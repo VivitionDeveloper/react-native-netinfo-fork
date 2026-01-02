@@ -14,6 +14,7 @@
 #if !TARGET_OS_TV && !TARGET_OS_MACCATALYST && !TARGET_OS_VISION
 #import <CoreTelephony/CTCarrier.h>
 #import <CoreTelephony/CTTelephonyNetworkInfo.h>
+#import <NetworkExtension/NetworkExtension.h>
 #endif
 @import SystemConfiguration.CaptiveNetwork;
 
@@ -26,6 +27,11 @@
 @property (nonatomic, strong) RNCConnectionStateWatcher *connectionStateWatcher;
 @property (nonatomic) BOOL isObserving;
 @property (nonatomic) NSDictionary *config;
+
+@property (atomic, copy, nullable) NSString *cachedSSID;
+@property (atomic, copy, nullable) NSString *cachedBSSID;
+@property (atomic, assign) BOOL isFetchingWiFiIdentifiers;
+@property (atomic, assign) NSTimeInterval lastWiFiIdentifiersFetchTime;
 
 @end
 
@@ -104,6 +110,74 @@ RCT_EXPORT_METHOD(configure:(NSDictionary *)config)
 
 #pragma mark - Utilities
 
+#if !TARGET_OS_TV && !TARGET_OS_OSX && !TARGET_OS_MACCATALYST
+- (void)refreshWiFiIdentifiersIfNeeded
+{
+  // Only iOS 14+ supports NEHotspotNetwork.fetchCurrent.
+  if (@available(iOS 14.0, *)) {
+    // Throttle to avoid spamming fetchCurrent. (e.g. once per 2 seconds)
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (self.isFetchingWiFiIdentifiers) {
+      return;
+    }
+    if (self.lastWiFiIdentifiersFetchTime > 0 && (now - self.lastWiFiIdentifiersFetchTime) < 2.0) {
+      return;
+    }
+
+    self.isFetchingWiFiIdentifiers = YES;
+    self.lastWiFiIdentifiersFetchTime = now;
+
+    [NEHotspotNetwork fetchCurrentWithCompletionHandler:^(NEHotspotNetwork * _Nullable currentNetwork) {
+      NSString *newSSID = currentNetwork.SSID;
+      NSString *newBSSID = currentNetwork.BSSID;
+
+      // Filter out some generic labels (optional)
+      if (newSSID != nil && ([newSSID isEqualToString:@"Wi-Fi"] || [newSSID isEqualToString:@"WLAN"])) {
+        newSSID = nil;
+      }
+
+      BOOL changed = NO;
+      BOOL ssidChanged =
+        (self.cachedSSID == nil && newSSID != nil) ||
+        (self.cachedSSID != nil && newSSID == nil) ||
+        (self.cachedSSID != nil && newSSID != nil && ![self.cachedSSID isEqualToString:newSSID]);
+
+      if (ssidChanged) {
+        self.cachedSSID = newSSID;
+        changed = YES;
+      }
+
+      BOOL bssidChanged =
+        (self.cachedBSSID == nil && newBSSID != nil) ||
+        (self.cachedBSSID != nil && newBSSID == nil) ||
+        (self.cachedBSSID != nil && newBSSID != nil && ![self.cachedBSSID isEqualToString:newBSSID]);
+
+      if (bssidChanged) {
+        self.cachedBSSID = newBSSID;
+        changed = YES;
+      }
+
+      self.isFetchingWiFiIdentifiers = NO;
+
+      // If identifiers changed, emit an updated event to JS.
+      // We do NOT block state building; we just push a refresh.
+      if (changed) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          RNCConnectionState *state = self.connectionStateWatcher.currentState;
+          if (state != nil) {
+            [self connectionStateWatcher:self.connectionStateWatcher didUpdateState:state];
+          }
+        });
+      }
+    }];
+
+    return;
+  }
+
+  // iOS < 14: do nothing (or keep old behavior if you care).
+}
+#endif
+
 // Converts the state into a dictionary to send over the bridge
 - (NSDictionary *)currentDictionaryFromUpdateState:(RNCConnectionState *)state withInterface:(nullable NSString *)requestedInterface
 {
@@ -131,13 +205,26 @@ RCT_EXPORT_METHOD(configure:(NSDictionary *)config)
     details[@"ipAddress"] = [self ipAddress] ?: NSNull.null;
     details[@"subnet"] = [self subnet] ?: NSNull.null;
     #if !TARGET_OS_TV && !TARGET_OS_OSX && !TARGET_OS_MACCATALYST && !TARGET_OS_VISION
+      BOOL shouldFetch = [requestedInterface isEqualToString:RNCConnectionTypeWifi] &&
+                          self.config != nil &&
+                          [self.config[@"shouldFetchWiFiSSID"] boolValue];
       /*
         Without one of the conditions needed to use CNCopyCurrentNetworkInfo, it will leak memory.
         Clients should only set the shouldFetchWiFiSSID to true after ensuring requirements are met to get (B)SSID.
       */
-      if (self.config && self.config[@"shouldFetchWiFiSSID"]) {
-        details[@"ssid"] = [self ssid] ?: NSNull.null;
-        details[@"bssid"] = [self bssid] ?: NSNull.null;
+      if (shouldFetch) {
+        // Only when state indicates WiFi and connected
+        if (state != nil &&
+            [state.type isEqualToString:RNCConnectionTypeWifi] &&
+            state.connected) {
+          [self refreshWiFiIdentifiersIfNeeded];
+        } else {
+          // Not on WiFi: clear cache so you don't keep old SSID
+          self.cachedSSID = nil;
+          self.cachedBSSID = nil;
+        }
+        details[@"ssid"] = [self cachedSSID] ?: NSNull.null;
+        details[@"bssid"] = [self cachedBSSID] ?: NSNull.null;
       }
     #endif
   }
@@ -230,38 +317,12 @@ RCT_EXPORT_METHOD(configure:(NSDictionary *)config)
 #if !TARGET_OS_TV && !TARGET_OS_OSX && !TARGET_OS_MACCATALYST
 - (NSString *)ssid
 {
-  NSArray *interfaceNames = CFBridgingRelease(CNCopySupportedInterfaces());
-  NSDictionary *SSIDInfo;
-  NSString *SSID = NULL;
-  for (NSString *interfaceName in interfaceNames) {
-    // CNCopyCurrentNetworkInfo is deprecated for iOS 13+, need to override & use fetchCurrentWithCompletionHandler
-    SSIDInfo = CFBridgingRelease(CNCopyCurrentNetworkInfo((__bridge CFStringRef)interfaceName));
-    if (SSIDInfo.count > 0) {
-        SSID = SSIDInfo[@"SSID"];
-        if ([SSID isEqualToString:@"Wi-Fi"] || [SSID isEqualToString:@"WLAN"]){
-          SSID = NULL;
-        }
-        break;
-    }
-  }
-  return SSID;
+  return [self cachedSSID];
 }
 
 - (NSString *)bssid
 {
-  NSArray *interfaceNames = CFBridgingRelease(CNCopySupportedInterfaces());
-  NSDictionary *networkDetails;
-  NSString *BSSID = NULL;
-  for (NSString *interfaceName in interfaceNames) {
-        // CNCopyCurrentNetworkInfo is deprecated for iOS 13+, need to override & use fetchCurrentWithCompletionHandler
-      networkDetails = CFBridgingRelease(CNCopyCurrentNetworkInfo((__bridge CFStringRef)interfaceName));
-      if (networkDetails.count > 0)
-      {
-          BSSID = networkDetails[(NSString *) kCNNetworkInfoKeyBSSID];
-          break;
-      }
-  }
-  return BSSID;
+  return [self cachedBSSID];
 }
 #endif
 

@@ -11,6 +11,7 @@ Pod::Spec.new do |s|
   s.authors      = package['author']
   s.homepage     = package['homepage']
   s.platforms    = { :ios => "9.0", :tvos => "9.2", :osx => "10.14", :visionos => "1.0" }
+  s.frameworks   = 'NetworkExtension'
 
   s.source       = { :git => "https://github.com/react-native-community/react-native-netinfo.git", :tag => "v#{s.version}" }
   s.source_files  = "ios/**/*.{h,m}"
