@@ -58,3 +58,8 @@ package-lock.json
 msbuild.binlog
 
 .xcode.env
+
+.expo/
+
+# build output
+*.js
